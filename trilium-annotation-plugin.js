@@ -1,7 +1,8 @@
-// Trilium 批注插件 - v3.2 (多行输入增强版)
+// Trilium 批注插件 - v3.5 (浮动工具栏最终修复版)
 // 更新日志：
-// v3.2: 【用户体验改进】支持多行文本输入，增大输入窗口，支持滚动
-// v3.1: 将批注内容编码到链接 URL 中
+// v3.5: 【关键修复】从现有按钮获取 ButtonView 类，解决运行时类访问问题
+// v3.4: 直接修改 BalloonToolbar 的 items 配置
+// v3.3-fixed: 修复 commands API 兼容性问题
 // 使用说明：
 // 1. 在 Trilium 中创建一个代码笔记
 // 2. 将此代码粘贴进去
@@ -12,18 +13,18 @@
 class TriliumAnnotationPlugin {
     constructor() {
         this.annotationCount = 0;
-        console.log('[批注插件] v3.2 初始化');
+        this.registeredEditors = new WeakSet();
+        console.log('[批注插件] v3.5 初始化');
     }
 
     async init() {
         await this.waitForEditor();
         this.addStyles();
-        this.setupAnnotationCommand();
-        this.addToolbarButton();
-        this.setupToolbarObserver();
+        this.setupEditorHook();
+        this.setupExistingEditors();
         this.rebindExistingAnnotations();
         this.setupContentObserver();
-        console.log('[批注插件] v3.2 初始化完成');
+        console.log('[批注插件] v3.5 初始化完成 - 支持浮动工具栏');
     }
 
     async waitForEditor() {
@@ -40,70 +41,294 @@ class TriliumAnnotationPlugin {
         });
     }
 
-    setupAnnotationCommand() {
-        const editorElement = document.querySelector('.ck-editor__editable');
-        if (!editorElement || !editorElement.ckeditorInstance) {
-            console.warn('[批注插件] 未找到编辑器实例');
-            return;
-        }
+    setupEditorHook() {
+        const observer = new MutationObserver((mutations) => {
+            mutations.forEach(() => {
+                const editors = document.querySelectorAll('.ck-editor__editable');
+                editors.forEach(el => {
+                    if (el.ckeditorInstance && !this.registeredEditors.has(el.ckeditorInstance)) {
+                        this.registerAnnotationPlugin(el.ckeditorInstance);
+                        this.registeredEditors.add(el.ckeditorInstance);
+                    }
+                });
+            });
+        });
 
-        const editor = editorElement.ckeditorInstance;
-        editor.commands.add('addAnnotation', {
-            execute: () => {
+        observer.observe(document.body, {
+            childList: true,
+            subtree: true
+        });
+
+        console.log('[批注插件] 编辑器钩子已安装');
+    }
+
+    setupExistingEditors() {
+        const editors = document.querySelectorAll('.ck-editor__editable');
+        editors.forEach(el => {
+            if (el.ckeditorInstance && !this.registeredEditors.has(el.ckeditorInstance)) {
+                this.registerAnnotationPlugin(el.ckeditorInstance);
+                this.registeredEditors.add(el.ckeditorInstance);
+            }
+        });
+    }
+
+    getButtonViewClass(editor) {
+        // 尝试多种方式获取 ButtonView 类
+        try {
+            // 方法 1: 从现有按钮获取构造函数
+            const componentFactory = editor.ui.componentFactory;
+
+            // 尝试创建一个已知的按钮来获取 ButtonView 类
+            const knownButtons = ['bold', 'italic', 'link', 'undo'];
+
+            for (const buttonName of knownButtons) {
+                try {
+                    if (componentFactory.has(buttonName)) {
+                        const tempButton = componentFactory.create(buttonName);
+                        if (tempButton && tempButton.constructor) {
+                            console.log('[批注插件] 从', buttonName, '按钮获取了 ButtonView 类');
+                            return tempButton.constructor;
+                        }
+                    }
+                } catch (e) {
+                    // 继续尝试下一个
+                }
+            }
+
+            // 方法 2: 从全局对象获取
+            if (window.CKEditor5 && window.CKEditor5.ui && window.CKEditor5.ui.ButtonView) {
+                console.log('[批注插件] 从全局 CKEditor5 对象获取 ButtonView');
+                return window.CKEditor5.ui.ButtonView;
+            }
+
+            // 方法 3: 从编辑器对象获取
+            if (editor.ui && editor.ui.ButtonView) {
+                console.log('[批注插件] 从 editor.ui 获取 ButtonView');
+                return editor.ui.ButtonView;
+            }
+
+            console.error('[批注插件] 无法获取 ButtonView 类');
+            return null;
+
+        } catch (error) {
+            console.error('[批注插件] 获取 ButtonView 类时出错:', error);
+            return null;
+        }
+    }
+
+    registerAnnotationPlugin(editor) {
+        try {
+            const componentFactory = editor.ui.componentFactory;
+
+            // 检查是否已注册
+            try {
+                if (componentFactory._components && componentFactory._components.has &&
+                    componentFactory._components.has('annotation')) {
+                    console.log('[批注插件] 按钮已注册，跳过注册步骤');
+                    this.addToBalloonToolbar(editor);
+                    return;
+                }
+            } catch (e) {
+                // 忽略检查错误，继续注册
+            }
+
+            // 获取 ButtonView 类
+            const ButtonView = this.getButtonViewClass(editor);
+
+            if (!ButtonView) {
+                console.error('[批注插件] 无法找到 ButtonView 类，使用降级方案');
+                this.fallbackToDOM(editor);
+                return;
+            }
+
+            // 注册 UI 组件到 componentFactory
+            componentFactory.add('annotation', (locale) => {
+                const view = new ButtonView(locale);
+
+                view.set({
+                    label: '添加批注',
+                    icon: this.getAnnotationIcon(),
+                    tooltip: true,
+                    withText: false
+                });
+
+                // 绑定到编辑器只读状态
+                try {
+                    view.bind('isEnabled').to(
+                        editor,
+                        'isReadOnly',
+                        isReadOnly => !isReadOnly
+                    );
+                } catch (e) {
+                    view.isEnabled = true;
+                }
+
+                // 点击时执行批注功能
+                view.on('execute', () => {
+                    this.handleAddAnnotation(editor);
+                });
+
+                return view;
+            });
+
+            // 添加到浮动工具栏和固定工具栏
+            this.addToBalloonToolbar(editor);
+            this.addToClassicToolbar(editor);
+
+            console.log('[批注插件] 已为编辑器注册批注功能');
+        } catch (error) {
+            console.error('[批注插件] 注册失败:', error);
+            this.fallbackToDOM(editor);
+        }
+    }
+
+    addToBalloonToolbar(editor) {
+        try {
+            // 检查是否有 BalloonToolbar 插件
+            if (!editor.plugins || !editor.plugins.has('BalloonToolbar')) {
+                console.log('[批注插件] 未找到 BalloonToolbar 插件，可能是固定工具栏模式');
+                return;
+            }
+
+            const balloonToolbar = editor.plugins.get('BalloonToolbar');
+
+            if (!balloonToolbar.toolbarView || !balloonToolbar.toolbarView.items) {
+                console.log('[批注插件] BalloonToolbar 没有 toolbarView.items');
+                return;
+            }
+
+            const items = balloonToolbar.toolbarView.items;
+
+            // 检查是否已添加
+            let hasAnnotation = false;
+            items.forEach(item => {
+                const label = item.label || item.buttonView?.label || '';
+                if (label === '添加批注') {
+                    hasAnnotation = true;
+                }
+            });
+
+            if (hasAnnotation) {
+                console.log('[批注插件] 批注按钮已在浮动工具栏中');
+                return;
+            }
+
+            // 创建按钮
+            const componentFactory = editor.ui.componentFactory;
+            if (!componentFactory.has('annotation')) {
+                console.warn('[批注插件] annotation 组件未注册');
+                return;
+            }
+
+            const button = componentFactory.create('annotation');
+
+            if (!button) {
+                console.warn('[批注插件] 无法创建 annotation 按钮');
+                return;
+            }
+
+            // 找到 link 按钮的位置
+            let insertIndex = -1;
+            items.forEach((item, index) => {
+                const label = item.label || item.buttonView?.label || '';
+                if (label && (label.toLowerCase().includes('link') || label.includes('链接'))) {
+                    insertIndex = index + 1;
+                }
+            });
+
+            // 添加按钮
+            if (insertIndex > 0 && insertIndex <= items.length) {
+                items.add(button, insertIndex);
+                console.log('[批注插件] ✓ 批注按钮已添加到浮动工具栏（位置：', insertIndex, '）');
+            } else {
+                items.add(button);
+                console.log('[批注插件] ✓ 批注按钮已添加到浮动工具栏（末尾）');
+            }
+
+        } catch (error) {
+            console.error('[批注插件] 添加到浮动工具栏失败:', error);
+            console.error('[批注插件] 错误详情:', error.stack);
+        }
+    }
+
+    addToClassicToolbar(editor) {
+        setTimeout(() => {
+            try {
+                const toolbar = document.querySelector('.classic-toolbar-widget:not(.hidden-ext) .ck-toolbar__items');
+
+                if (!toolbar) {
+                    return;
+                }
+
+                if (toolbar.querySelector('.annotation-button') ||
+                    toolbar.querySelector('[data-cke-tooltip-text*="批注"]')) {
+                    return;
+                }
+
+                this.injectButtonToDOM(toolbar, editor);
+                console.log('[批注插件] ✓ 批注按钮已添加到固定工具栏');
+
+            } catch (error) {
+                console.warn('[批注插件] 添加到固定工具栏失败:', error);
+            }
+        }, 500);
+    }
+
+    fallbackToDOM(editor) {
+        console.log('[批注插件] 使用 DOM 注入降级方案');
+        setTimeout(() => {
+            const toolbars = [
+                document.querySelector('.classic-toolbar-widget:not(.hidden-ext) .ck-toolbar__items'),
+                document.querySelector('.ck-toolbar__items')
+            ];
+
+            for (const toolbar of toolbars) {
+                if (toolbar && !toolbar.querySelector('.annotation-button')) {
+                    this.injectButtonToDOM(toolbar, editor);
+                    console.log('[批注插件] ✓ 已通过 DOM 注入添加按钮');
+                    break;
+                }
+            }
+        }, 500);
+    }
+
+    injectButtonToDOM(toolbar, editor) {
+        try {
+            const item = document.createElement('div');
+            item.className = 'ck ck-toolbar__item';
+
+            const button = document.createElement('button');
+            button.className = 'annotation-button annotation-toolbar-btn ck ck-button';
+            button.type = 'button';
+            button.title = '添加批注 (选中文字后点击)';
+            button.setAttribute('data-cke-tooltip-text', '添加批注');
+            button.style.cssText = 'background: transparent; border: 0; cursor: pointer; padding: 0.4em; margin: 0; display: flex; align-items: center;';
+            button.innerHTML = this.getAnnotationIcon();
+
+            button.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
                 this.handleAddAnnotation(editor);
-            }
-        });
+            });
 
-        console.log('[批注插件] 批注命令已注册');
+            item.appendChild(button);
+
+            const linkButton = toolbar.querySelector('.ck-link-ui, .ck-button[data-cke-tooltip-text*="Link"]');
+            if (linkButton && linkButton.parentElement) {
+                linkButton.parentElement.insertAdjacentElement('afterend', item);
+            } else {
+                toolbar.appendChild(item);
+            }
+
+        } catch (e) {
+            console.error('[批注插件] DOM 注入失败:', e);
+        }
     }
 
-    addToolbarButton() {
-        const toolbar = document.querySelector('.classic-toolbar-widget:not(.hidden-ext) .ck-toolbar__items');
-        if (!toolbar || toolbar.querySelector('.annotation-button')) {
-            return;
-        }
-
-        const item = document.createElement('div');
-        item.className = 'ck ck-toolbar__item';
-
-        const button = document.createElement('button');
-        button.className = 'annotation-button annotation-toolbar-btn';
-        button.type = 'button';
-        button.title = '添加批注 (选中文字后点击)';
-        button.style.cssText = 'background: transparent; border: 0; cursor: pointer; padding: 0.4em; margin: 0; display: flex; align-items: center;';
-        button.innerHTML = `
-            <svg class="ck ck-icon ck-button__icon" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg" style="width: 20px; height: 20px; fill: currentColor;">
-                <path d="M18 2H2c-.6 0-1 .4-1 1v14c0 .6.4 1 1 1h16c.6 0 1-.4 1-1V3c0-.6-.4-1-1-1zM3 4h14v3H3V4zm0 5h14v2H3V9zm0 4h9v2H3v-2z"/>
-            </svg>
-        `;
-
-        button.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            const editorElement = document.querySelector('.ck-editor__editable');
-            if (editorElement && editorElement.ckeditorInstance) {
-                this.handleAddAnnotation(editorElement.ckeditorInstance);
-            }
-        });
-
-        item.appendChild(button);
-
-        const linkButton = toolbar.querySelector('.ck-link-ui');
-        if (linkButton && linkButton.parentElement) {
-            linkButton.parentElement.insertAdjacentElement('afterend', item);
-        } else {
-            toolbar.appendChild(item);
-        }
-
-        console.log('[批注插件] 批注按钮已添加');
-    }
-
-    setupToolbarObserver() {
-        const observer = new MutationObserver(() => {
-            setTimeout(() => this.addToolbarButton(), 300);
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-        console.log('[批注插件] 工具栏监视器已启动');
+    getAnnotationIcon() {
+        return `<svg class="ck ck-icon ck-button__icon" viewBox="0 0 20 20" xmlns="http://www.w3.org/2000/svg" style="width: 20px; height: 20px; fill: currentColor;">
+            <path d="M18 2H2c-.6 0-1 .4-1 1v14c0 .6.4 1 1 1h16c.6 0 1-.4 1-1V3c0-.6-.4-1-1-1zM3 4h14v3H3V4zm0 5h14v2H3V9zm0 4h9v2H3v-2z"/>
+        </svg>`;
     }
 
     setupContentObserver() {
@@ -126,7 +351,6 @@ class TriliumAnnotationPlugin {
         if (!editorElement) return;
 
         const links = editorElement.querySelectorAll('a[href*="#annotation-"]');
-        console.log('[批注插件] 重新绑定批注链接:', links.length);
 
         links.forEach(link => {
             const newLink = link.cloneNode(true);
@@ -153,7 +377,6 @@ class TriliumAnnotationPlugin {
             }
 
             const selectedText = this.getSelectedText(editor);
-            console.log('[批注插件] 选中文本:', selectedText);
 
             if (!selectedText || selectedText.trim() === '') {
                 this.showNotification('请选择有效的文字', 'warning');
@@ -171,12 +394,8 @@ class TriliumAnnotationPlugin {
             }
 
             const annotationId = `annotation-${Date.now()}-${++this.annotationCount}`;
-
-            // 将批注内容编码到 URL 中
             const encodedText = encodeURIComponent(annotationText);
             const linkUrl = `#${annotationId}?text=${encodedText}`;
-
-            console.log('[批注插件] 生成批注链接:', linkUrl);
 
             await new Promise(resolve => setTimeout(resolve, 150));
 
@@ -188,7 +407,6 @@ class TriliumAnnotationPlugin {
                     const newRange = writer.createRange(start, end);
 
                     writer.setAttribute('linkHref', linkUrl, newRange);
-                    console.log('[批注插件] 已添加 linkHref:', linkUrl);
                 } catch (e) {
                     console.error('[批注插件] 添加属性时出错:', e);
                     throw e;
@@ -200,7 +418,6 @@ class TriliumAnnotationPlugin {
             }, 300);
 
             this.showNotification('批注添加成功！', 'success');
-            console.log('[批注插件] 批注已添加');
 
         } catch (error) {
             console.error('[批注插件] 错误:', error);
@@ -241,7 +458,6 @@ class TriliumAnnotationPlugin {
                 z-index: 99999;
             `;
 
-            // HTML 转义处理
             const escapeHtml = (text) => {
                 const div = document.createElement('div');
                 div.textContent = text;
@@ -288,7 +504,6 @@ class TriliumAnnotationPlugin {
 
             setTimeout(() => {
                 textarea.focus();
-                // 将光标移到文本末尾
                 textarea.setSelectionRange(textarea.value.length, textarea.value.length);
             }, 100);
 
@@ -312,7 +527,6 @@ class TriliumAnnotationPlugin {
             cancelBtn.addEventListener('click', cancel);
             overlay.addEventListener('click', cancel);
 
-            // Ctrl+Enter 快捷键确认
             textarea.addEventListener('keydown', (e) => {
                 if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                     e.preventDefault();
@@ -328,7 +542,6 @@ class TriliumAnnotationPlugin {
     async viewAnnotation(linkElement) {
         try {
             const href = linkElement.getAttribute('href') || '';
-            console.log('[批注插件] 链接 href:', href);
 
             let annotationText = '';
 
@@ -338,8 +551,6 @@ class TriliumAnnotationPlugin {
                     annotationText = decodeURIComponent(urlParts[1]);
                 }
             }
-
-            console.log('[批注插件] 解码后的批注内容:', annotationText);
 
             if (!annotationText) {
                 this.showNotification('未找到批注内容', 'warning');
@@ -353,7 +564,6 @@ class TriliumAnnotationPlugin {
             }
 
             if (newText.trim() === '') {
-                // 删除批注
                 const text = linkElement.textContent;
                 const editorElement = document.querySelector('.ck-editor__editable');
 
@@ -376,7 +586,6 @@ class TriliumAnnotationPlugin {
 
                 this.showNotification('批注已删除', 'info');
             } else {
-                // 更新批注
                 const href = linkElement.getAttribute('href') || '';
                 const baseHref = href.split('?')[0];
                 const encodedText = encodeURIComponent(newText);
@@ -401,7 +610,6 @@ class TriliumAnnotationPlugin {
                 }
 
                 this.showNotification('批注已更新', 'success');
-                console.log('[批注插件] 批注已更新为:', newText);
             }
         } catch (error) {
             console.error('[批注插件] 查看批注时出错:', error);
@@ -508,7 +716,6 @@ class TriliumAnnotationPlugin {
                 }
             }
 
-            /* 自定义滚动条样式（可选） */
             .annotation-input-field::-webkit-scrollbar {
                 width: 8px;
             }
@@ -532,8 +739,8 @@ class TriliumAnnotationPlugin {
     }
 
     showNotification(message, type = 'info') {
-        if (typeof toastService !== 'undefined' && toastService.showMessage) {
-            toastService.showMessage(message);
+        if (typeof api !== 'undefined' && api.showMessage) {
+            api.showMessage(message);
             return;
         }
 
